@@ -9,6 +9,7 @@
 void VerbosePrint(char * source, char * stage);
 
 char * ConvertShaderConditionally(struct shader_s * shader_source, int second_pass);
+char * ConvertShaderSpv(struct shader_s * shader_source, int second_pass);
 char * ConvertShaderVgpu(struct shader_s * shader_source, int second_pass);
 char * ConvertShaderMinimal(char * input, int is_fragment);
 char * ConvertShaderMinimalBackport(char * input, size_t * length, int is_fragment, int destructive);

@@ -288,7 +288,8 @@ static const char* GLESHeader[] = {
   "#version 120\n%sprecision %s float;\nprecision %s int;\n",
   "#version 310 es\n%sprecision %s float;\nprecision %s int;\n",
   "#version 300 es\n%sprecision %s float;\nprecision %s int;\n",
-  "#version 320 es\n%sprecision %s float;\nprecision %s int;\n"
+  "#version 320 es\n%sprecision %s float;\nprecision %s int;\n",
+  "#version 330 core\n%s"   /* 5: input of the glslang/SPIRV-Cross pipeline (forwardPort==2) */
 };
 
 static const char* gl4es_transpose =
@@ -496,7 +497,13 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need, i
   int versionHeader = 0;
   //SHUT_LOGD("version string: %s", versionString);
 
-  if(forwardPort) {
+  /* forwardPort==2: legacy lowering only. Builtins are turned into gl4es attributes/uniforms,
+     * and the result is a plain desktop 330 core shader (modulo the attribute/varying keywords,
+     * see ConvertShaderSpv) handed to glslang. All the ESSL specific hacks below are skipped
+     * as SPIRV-Cross produces the final ESSL. */
+  const int spvFront = (forwardPort==2);
+  if(spvFront) versionHeader = 5;
+  else if(forwardPort) {
     if(hardext.glsl120) versionHeader = 1;
     else if(hardext.glsl320es) versionHeader = 4;
     else if(hardext.glsl310es) versionHeader = 2;
@@ -553,7 +560,7 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need, i
   // check if the shader uses 3D textures
   int threed_texture = (strstr(pBuffer, "sampler3D"))?1:0;
   const char* GLESUse3DTexture = "#extension GL_OES_texture_3D : enable\n";
-  if(threed_texture) {
+  if(threed_texture && !spvFront) {
       Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, 1), GLESUse3DTexture, Tmp, &tmpsize); // no fallback possible if device does not support 3D textures
   }
 
@@ -564,7 +571,7 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need, i
   "float dFdy(float p) {return 0.0001;}\nvec2 dFdy(vec2 p) {return vec2(0.0001);}\nvec3 dFdy(vec3 p) {return vec3(0.0001);}\n"
   "float fwidth(float p) {return abs(dFdx(p))+abs(dFdy(p));}\nvec2 fwidth(vec2 p) {return abs(dFdx(p))+abs(dFdy(p));}\n"
   "vec3 fwidth(vec3 p) {return abs(dFdx(p))+abs(dFdy(p));}\n";
-  if (derivatives) {
+  if (derivatives && !spvFront) {
     /* If #extension is used, it should be placed before the second line of the header. */
     if(hardext.derivatives)
       Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, 1), GLESUseDerivative, Tmp, &tmpsize);
@@ -573,7 +580,7 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need, i
     headline++;
   }
   // check if draw_buffers may be used (no fallback here :( )
-  if(hardext.maxdrawbuffers>1 && strstr(pBuffer, "gl_FragData[")) {
+  if(!spvFront && hardext.maxdrawbuffers>1 && strstr(pBuffer, "gl_FragData[")) {
     Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, 1), useEXTDrawBuffers, Tmp, &tmpsize);
   }
   // if some functions are used, add some int/float alternative, provided we aren't porting to ESSL 3.0+
@@ -594,7 +601,7 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need, i
         Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, headline), HackAltMod, Tmp, &tmpsize);
     }
   }
-  if(!isVertex && hardext.shaderlod && 
+  if(!spvFront && !isVertex && hardext.shaderlod &&
     (gl4es_find_string(Tmp, "texture2DLod") || gl4es_find_string(Tmp, "texture2DProjLod") 
   || gl4es_find_string(Tmp, "textureCubeLod") 
   || gl4es_find_string(Tmp, "texture2DGradARB") || gl4es_find_string(Tmp, "texture2DProjGradARB")|| gl4es_find_string(Tmp, "textureCubeGradARB") 
@@ -602,7 +609,7 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need, i
       const char* GLESUseShaderLod = "#extension GL_EXT_shader_texture_lod : enable\n";
       Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, 1), GLESUseShaderLod, Tmp, &tmpsize);
   }
-  if(!isVertex && (gl4es_find_string(Tmp, "texture2DLod"))) {
+  if(!spvFront && !isVertex && (gl4es_find_string(Tmp, "texture2DLod"))) {
       if(hardext.shaderlod) {
         Tmp = gl4es_inplace_replace(Tmp, &tmpsize, "texture2DLod", "texture2DLodEXT");
       } else {
@@ -610,7 +617,7 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need, i
         Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, headline), texture2DLodAlt, Tmp, &tmpsize);
       }
   }
-  if(!isVertex && (gl4es_find_string(Tmp, "texture2DProjLod"))) {
+  if(!spvFront && !isVertex && (gl4es_find_string(Tmp, "texture2DProjLod"))) {
       if(hardext.shaderlod) {
         Tmp = gl4es_inplace_replace(Tmp, &tmpsize, "texture2DProjLod", "texture2DProjLodEXT");
       } else {
@@ -618,7 +625,7 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need, i
         Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, headline), texture2DProjLodAlt, Tmp, &tmpsize);
       }
   }
-  if(!isVertex && (gl4es_find_string(Tmp, "textureCubeLod"))) {
+  if(!spvFront && !isVertex && (gl4es_find_string(Tmp, "textureCubeLod"))) {
       if(hardext.shaderlod) {
         if(!hardext.cubelod)
           Tmp = gl4es_inplace_replace(Tmp, &tmpsize, "textureCubeLod", "textureCubeLodEXT");
@@ -627,7 +634,7 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need, i
         Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, headline), textureCubeLodAlt, Tmp, &tmpsize);
       }
   }
-  if(!isVertex && (gl4es_find_string(Tmp, "texture2DGradARB"))) {
+  if(!spvFront && !isVertex && (gl4es_find_string(Tmp, "texture2DGradARB"))) {
       if(hardext.shaderlod) {
         Tmp = gl4es_inplace_replace(Tmp, &tmpsize, "texture2DGradARB", "texture2DGradEXT");
       } else {
@@ -635,7 +642,7 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need, i
         Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, headline), texture2DGradAlt, Tmp, &tmpsize);
       }
   }
-  if(!isVertex && (gl4es_find_string(Tmp, "texture2DProjGradARB"))) {
+  if(!spvFront && !isVertex && (gl4es_find_string(Tmp, "texture2DProjGradARB"))) {
       if(hardext.shaderlod) {
         Tmp = gl4es_inplace_replace(Tmp, &tmpsize, "texture2DProjGradARB", "texture2DProjGradEXT");
       } else {
@@ -643,7 +650,7 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need, i
         Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, headline), texture2DProjGradAlt, Tmp, &tmpsize);
       }
   }
-  if(!isVertex && (gl4es_find_string(Tmp, "textureCubeGradARB"))) {
+  if(!spvFront && !isVertex && (gl4es_find_string(Tmp, "textureCubeGradARB"))) {
       if(hardext.shaderlod) {
         if(!hardext.cubelod)
           Tmp = gl4es_inplace_replace(Tmp, &tmpsize, "textureCubeGradARB", "textureCubeGradEXT");
@@ -667,7 +674,7 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need, i
   }
 
     // now check to remove trailling "f" after float, as it's not supported too
-  newptr = Tmp;
+  newptr = spvFront ? Tmp+strlen(Tmp) : Tmp;  // glslang handles float suffixes: skip the hack
   // simple state machine...
   int state = 0;
   while (*newptr!=0x00) {

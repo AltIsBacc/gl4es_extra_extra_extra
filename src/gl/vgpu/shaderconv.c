@@ -12,84 +12,217 @@
 #include "../../glx/hardext.h"
 #include "../shaderconv.h"
 #include "../iProtecc/iprotecc.h"
-#include "../../glsl_optimizer/src/code/c_wrapper.h"
+#include "../spvconv/spvconv.h"
 
 int NO_OPERATOR_VALUE = 9999;
 int ADDITIVE_OPERATOR_VALUE = 5;
 
+/* ------------------------------------------------------------------------------------------
+ * GLSL -> ESSL through glslang (GLSL -> SPIR-V) and SPIRV-Cross (SPIR-V -> ESSL).
+ *
+ * glslang only produces SPIR-V from desktop >= 330 core or ES >= 310 sources, so:
+ *  - modern shaders (ES 300/310/320 or desktop >= 330 core) are handed over as is
+ *    (ES 300 is bumped to 310, which is a strict superset for what SPIR-V needs);
+ *  - legacy shaders (desktop < 330, compatibility profile, ESSL 100, no #version) first go
+ *    through the gl4es builtin lowering (gl_Vertex, gl_ModelViewMatrix, gl_TexCoord, ...,
+ *    see ConvertShader(.., forwardPort=2)) and the few keyword renames that remain, and become
+ *    a `#version 330 core` shader.
+ * ------------------------------------------------------------------------------------------ */
+
+/** Blank the `#extension` lines that only make sense for a real ESSL 100 driver, glslang knows
+ *  the desktop equivalent as core functionality. Length is preserved. */
+static void BlankEsExtensions(char * s) {
+    static const char * const names[] = {
+        "GL_OES_", "GL_EXT_draw_buffers", "GL_EXT_shader_texture_lod", "GL_EXT_frag_depth",
+        "GL_EXT_shadow_samplers", NULL
+    };
+    char * line = s;
+    while (*line) {
+        char * eol = strchr(line, '\n');
+        char * p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (strncmp(p, "#extension", 10) == 0) {
+            int hit = 0;
+            for (int i = 0; names[i] && !hit; ++i) {
+                char * f = strstr(p, names[i]);
+                if (f && (!eol || f < eol)) hit = 1;
+            }
+            if (hit) memset(p, ' ', eol ? (size_t)(eol - p) : strlen(p));
+        }
+        if (!eol) break;
+        line = eol + 1;
+    }
+}
+
+/** Is the #version line of this shader a compatibility profile one ? */
+static int IsCompatibilityVersion(const char * source) {
+    const char * v = strstr(source, "#version");
+    if (!v) return 0;
+    const char * eol = strchr(v, '\n');
+    const char * c = strstr(v, "compatibility");
+    return (c && (!eol || c < eol)) ? 1 : 0;
+}
+
+/** Modern shaders go to glslang untouched, except for ES 300 -> 310 (SPIR-V needs ES >= 310). */
+static char * PrepareModernSource(const char * source, int version) {
+    if (version != 300) return strdup(source);
+    const char * v = strstr(source, "#version");
+    if (!v) return strdup(source);
+    const char * eol = strchr(v, '\n');
+    size_t head = (size_t)(v - source);
+    size_t tail = eol ? strlen(eol) : 0;
+    char * out = (char *)malloc(head + 16 + tail + 1);
+    memcpy(out, source, head);
+    memcpy(out + head, "#version 310 es", 15);
+    if (tail) memcpy(out + head + 15, eol, tail);
+    out[head + 15 + tail] = '\0';
+    return out;
+}
+
+/** Legacy shaders: gl4es builtin lowering, then ESSL 100 / GLSL 1.x keywords -> GLSL 330 core */
+static char * LowerLegacySource(struct shader_s * shader_source, int is_vertex) {
+    char * s = ConvertShader(shader_source->source, is_vertex, &shader_source->need, 2);
+    if (!s) return NULL;
+    int len = (int)strlen(s) + 1;
+    VerbosePrint(s, "gl4es builtin lowering (glslang front-end)");
+
+    BlankEsExtensions(s);
+
+    if (is_vertex) {
+        s = ReplaceVariableName(s, &len, "attribute", "in", 0);
+        s = ReplaceVariableName(s, &len, "varying", "out", 0);
+    } else {
+        s = ReplaceVariableName(s, &len, "varying", "in", 0);
+        s = ReplaceGLFragData(s, &len);
+        s = ReplaceGLFragColor(s, &len);
+    }
+
+    // GLSL 1.x / ESSL 1.00 texture function names
+    s = ReplaceFunctionName(s, &len, "texture2D", "texture");
+    s = ReplaceFunctionName(s, &len, "texture3D", "texture");
+    s = ReplaceFunctionName(s, &len, "textureCube", "texture");
+    s = ReplaceFunctionName(s, &len, "texture2DProj", "textureProj");
+    s = ReplaceFunctionName(s, &len, "texture2DLod", "textureLod");
+    s = ReplaceFunctionName(s, &len, "texture2DLodEXT", "textureLod");
+    s = ReplaceFunctionName(s, &len, "texture2DProjLod", "textureProjLod");
+    s = ReplaceFunctionName(s, &len, "texture2DProjLodEXT", "textureProjLod");
+    s = ReplaceFunctionName(s, &len, "textureCubeLod", "textureLod");
+    s = ReplaceFunctionName(s, &len, "textureCubeLodEXT", "textureLod");
+    s = ReplaceFunctionName(s, &len, "texture2DGradARB", "textureGrad");
+    s = ReplaceFunctionName(s, &len, "texture2DGradEXT", "textureGrad");
+    s = ReplaceFunctionName(s, &len, "texture2DProjGradARB", "textureProjGrad");
+    s = ReplaceFunctionName(s, &len, "texture2DProjGradEXT", "textureProjGrad");
+    s = ReplaceFunctionName(s, &len, "textureCubeGradARB", "textureGrad");
+    s = ReplaceFunctionName(s, &len, "textureCubeGradEXT", "textureGrad");
+    if (strstr(s, "gl_FragDepthEXT"))
+        s = ReplaceVariableName(s, &len, "gl_FragDepthEXT", "gl_FragDepth", 0);
+
+    VerbosePrint(s, "Lowered legacy shader (glslang input)");
+    return s;
+}
+
+/** The ESSL version SPIRV-Cross has to emit */
+static int GetTargetEsVersion(void) {
+    if (!hardext.glsl300es || globals4es.vgpu_backport) return 100;
+    return hardext.glsl320es ? 320 : hardext.glsl310es ? 310 : 300;
+}
+
+static char * RunSpvConv(const char * input, int is_vertex, int target, const char * what) {
+    char * err = NULL;
+    char * out = spvconv_glsl_to_essl(input, is_vertex, target, hardext.highp ? 1 : 0, &err);
+    if (!out && (globals4es.logshader || globals4es.vgpu_dump)) {
+        printf("LIBGL: shader conversion (%s) failed:\n%s\n", what, err ? err : "(no log)");
+        if (globals4es.vgpu_dump) printf("Input was:\n%s\n=======\n", input);
+    }
+    free(err);
+    return out;
+}
+
 /**
- * Makes more and more destructive conversions to make the shader compile
- * @param shader_source The shader as a string
+ * Converts shader_source->source with glslang + SPIRV-Cross.
+ * @return the ESSL shader (malloc'ed, also stored in shader_source->converted) or NULL on failure
+ */
+char * ConvertShaderSpv(struct shader_s * shader_source, int second_pass) {
+    (void)second_pass; // the conversion is exact, there is no "more destructive" second try
+    const int is_vertex = shader_source->type == GL_VERTEX_SHADER ? 1 : 0;
+    const int target = GetTargetEsVersion();
+    const int version = GetShaderVersion(shader_source->source);
+    const int is_es = (version == 300 || version == 310 || version == 320);
+    const int modern = is_es || (version >= 330 && !IsCompatibilityVersion(shader_source->source));
+
+    if (globals4es.vgpu_dump)
+        printf("SPV Shader source (%s, #version %d -> ESSL %d):\n%s\n", is_vertex ? "vertex" : "fragment", version, target, shader_source->source);
+
+    char * out = NULL;
+    if (modern) {
+        char * in = PrepareModernSource(shader_source->source, version);
+        out = RunSpvConv(in, is_vertex, target, "modern");
+        free(in);
+    }
+    if (!out) {
+        // legacy shaders, or "modern" ones that still use compatibility builtins
+        char * in = LowerLegacySource(shader_source, is_vertex);
+        if (in) {
+            out = RunSpvConv(in, is_vertex, target, "legacy");
+            free(in);
+        }
+    }
+    if (!out) return NULL;
+
+    size_t length = strlen(out);
+    out = OverridePrecision(out, &length);
+    if (globals4es.vgpu_dump)
+        printf("SPV Shader output:\n%s\n", out);
+    shader_source->converted = out;
+    return out;
+}
+
+/**
+ * Last resort, only used when glslang/SPIRV-Cross could not handle the shader: the plain gl4es
+ * textual conversion (no optimizer), with the historical ESSL 1.00 / ESSL 3.x post processing.
+ */
+static char * ConvertShaderTextual(struct shader_s * shader_source, int is_vertex, int shader_version) {
+    if (!hardext.glsl300es || globals4es.vgpu_backport) {
+        int cap = (int)strlen(shader_source->source) + 1;
+        char * tmp = strdup(shader_source->source);
+        tmp = BackportConstArrays(tmp, &cap);
+        char * conv = ConvertShader(tmp, is_vertex, &shader_source->need, 0);
+        free(tmp);
+        size_t newLength = strlen(conv);
+        if (shader_version >= 100)
+            conv = ConvertShaderMinimalBackport(conv, &newLength, !is_vertex, 1);
+        conv = OverridePrecision(conv, &newLength);
+        return conv;
+    }
+    char * conv = ConvertShader(shader_source->source, is_vertex, &shader_source->need, 1);
+    conv = ConvertShaderMinimal(conv, !is_vertex);
+    size_t newLength = strlen(conv);
+    conv = OverridePrecision(conv, &newLength);
+    return conv;
+}
+
+/**
+ * Entry point of the shader conversion, called on glShaderSource and when gl4es has to redo
+ * a shader (second_pass) to fix up a linking issue.
+ * @param shader_source The shader
  * @param second_pass Whether gl4es is attempting to solve a linking issue
  * @return The shader as a string
  */
 char * ConvertShaderConditionally(struct shader_s * shader_source, int second_pass){
     char buf[256];
     iprotecc_getstring(buf, IPROTECC_CRC1_SECOND, IPROTECC_CRC64_SECOND_A, IPROTECC_CRC64_SECOND_B);
-    int shaderCompileStatus = 0;
-    int shader_version = GetShaderVersion(shader_source->source);
-    int is_vertex = shader_source->type == GL_VERTEX_SHADER ? 1 : 0;
-
-    // ESSL 1.0 pipeline
-    if(!hardext.glsl300es || globals4es.vgpu_backport) {
-        if (globals4es.vgpu_dump){
-            printf("New VGPU Shader source (backward port):\n%s\n", shader_source->source);
-        }
-        // FIXME this may modify the source shader !
-        // Since the produced code is bigger than the original, it makes a copy of the source. Shouldn't be relied on.
-        // If no modification occurs, the source is returned as is and a copy is made by the "optimize_shader" function
-        size_t init_length = strlen(shader_source->source);
-        shader_source->converted = BackportConstArrays(shader_source->source, &init_length);
-        VerbosePrint(shader_source->converted, "optimize const arrays (backward port)");
-
-        shader_source->converted = optimize_shader(shader_source->converted, is_vertex, shader_version, 100, second_pass);
-        VerbosePrint(shader_source->converted, "Optimized shader (backward port)");
-
-        // Only possibility if to try to backport
-        shader_source->converted = ConvertShader(shader_source->converted == NULL ? shader_source->source : shader_source->converted, is_vertex, &shader_source->need, 0);
-        VerbosePrint(shader_source->converted, "Optimized shader (backward port) with gl4es post process");
-        size_t newLength = strlen(shader_source->converted);
-
-        // Force backport of newer features
-        if(shader_version >= 100) {
-            shader_source->converted = ConvertShaderMinimalBackport(shader_source->converted, &newLength, !is_vertex, 1);
-            VerbosePrint(shader_source->converted, "Optimized shader (backward port) with additional backport features");
-        }
-
-        // Skip testing, we only have one shot anyway
-        shader_source->converted = OverridePrecision(shader_source->converted, &newLength);
-        
-        if (globals4es.vgpu_dump){
-            printf("New VGPU Shader output (backward port):\n%s\n", shader_source->source);
-        }
-
-        return shader_source->converted;
-    }
-
-    // Always upconvert otherwise, to avoid linkage issues
-    if(shader_source->converted != NULL) {
+    if (shader_source->converted != NULL) {
         free(shader_source->converted);
         shader_source->converted = NULL;
     }
 
-    int target_version = hardext.glsl320es ? 320 : hardext.glsl310es ? 310 : 300;
+    char * out = ConvertShaderSpv(shader_source, second_pass);
+    if (out) return out;
 
-    if (globals4es.vgpu_dump){
-        printf("VGPU Shader source:\n%s\n", shader_source->source);
-    }
-
-    shader_source->converted = optimize_shader(shader_source->source, is_vertex, shader_version, target_version, second_pass);
-    VerbosePrint(shader_source->converted, "Optimized shader");
-    shader_source->converted = ConvertShader(shader_source->converted == NULL ? shader_source->source : shader_source->converted, is_vertex, &shader_source->need, 1);
-    VerbosePrint(shader_source->converted, "Optimized shader with gl4es post process");
-    shader_source->converted = ConvertShaderMinimal(shader_source->converted, !is_vertex);
-
-    size_t newLength = strlen(shader_source->converted);
-    shader_source->converted = OverridePrecision(shader_source->converted, &newLength);
-
-    if (globals4es.vgpu_dump){
-        printf("New VGPU Shader output:\n%s\n", shader_source->converted);
-    }
+    int is_vertex = shader_source->type == GL_VERTEX_SHADER ? 1 : 0;
+    int shader_version = GetShaderVersion(shader_source->source);
+    shader_source->converted = ConvertShaderTextual(shader_source, is_vertex, shader_version);
+    VerbosePrint(shader_source->converted, "Textual fallback conversion");
     return shader_source->converted;
 }
 
